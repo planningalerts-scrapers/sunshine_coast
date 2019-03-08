@@ -1,71 +1,72 @@
 require 'scraperwiki'
-require 'rubygems'
 require 'mechanize'
+require 'json'
 
-starting_url = 'http://pdonline.sunshinecoast.qld.gov.au/MasterView/Modules/Applicationmaster/default.aspx?page=found&1=thismonth&4a=MCU&6=F'
-comment_url = 'http://www.sunshinecoast.qld.gov.au/sitePage.cfm?code=develoment-app'
 
-def clean_whitespace(a)
-  a.gsub("\r", ' ').gsub("\n", ' ').squeeze(" ").strip
+case ENV['MORPH_PERIOD']
+when 'thismonth'
+  period = 'This Month'
+  startDate = ((Date.today) - (Date.today.mday) + 1)
+  endDate = (Date.today >> 1) - (Date.today.mday)
+when 'lastmonth'
+  period = 'Last Month'
+  startDate = ((Date.today << 1) - (Date.today.mday) + 1)
+  endDate = (Date.today) - (Date.today.mday)
+else
+  period = 'Last 14 Days'
+  startDate = (Date.today - 14)
+  endDate = Date.today
 end
+puts "Getting '" + period + "' data, changable via MORPH_PERIOD environment"
 
-def scrape_table(doc, comment_url)
-  doc.search('table tbody tr').each do |tr|
-    # Columns in table
-    # Show  Number  Submitted  Details
-    tds = tr.search('td')
+url = 'https://developmenti.sunshinecoast.qld.gov.au/Home/ApplicationTileSearch'
+payload = '{"Progress":"all","StartDateUnixEpochNumber":1549285200000,"EndDateUnixEpochNumber":1551963599999,"DateRangeField":"submitted","DateRangeDescriptor":"Last 30 Days","LotPlan":null,"LandNumber":null,"DANumber":null,"BANumber":null,"PlumbNumber":null,"IncludeDA":true,"IncludeBA":false,"IncludePlumb":false,"LocalityId":null,"DivisionId":null,"ApplicationTypeId":null,"SubCategoryUseId":null,"ShowCode":true,"ShowImpact":true,"ShowOther":true,"PagingStartIndex":0,"MaxRecords":200,"Boundary":null,"ViewPort":{"BoundaryType":"POLYGON","GeometryPropertyName":"geom_point","Boundary":[[{"Lat":-27.07045886388122,"Lng":151.12321057707288},{"Lat":-27.07045886388122,"Lng":154.78195825010755},{"Lat":-26.240905814925092,"Lng":154.78195825010755},{"Lat":-26.240905814925092,"Lng":151.12321057707288},{"Lat":-27.07045886388122,"Lng":151.12321057707288}]]},"IncludeAroundMe":false,"SortField":"submitted","SortAscending":true,"BBox":null,"PixelWidth":800,"PixelHeight":800}'
 
-    # Yes, this is "where no records"[sic]
-    break if tds[0].inner_text =~ /There where no records/
+## Update JSON fields
+json_hash = JSON.parse(payload)
+json_hash['StartDateUnixEpochNumber'] = startDate.to_time.to_i * 1000
+json_hash['EndDateUnixEpochNumber']   = endDate.to_time.to_i * 1000
+json_hash['DateRangeDescriptor']      = period
 
-    h = tds.map{|td| td.inner_html}
 
-    info_url = 'http://pdonline.sunshinecoast.qld.gov.au/MasterView/Modules/Applicationmaster/' + tds[0].at('a')['href'].strip
+agent = Mechanize.new
+page = agent.post url, json_hash.to_json, {'Content-Type' => 'application/json'}
 
+page.search('div.application-tile').each do |div|
+  matches = div.search('div.description-trunc').inner_text.split('Description: ')[1].split(' - ', 2)
+
+  matches.each.with_index do |match, index|
+    matches[index] = match.strip
+  end
+
+  ## clean up address a little if possible
+  if ( matches[0] == 'FASTTRACK'  ||
+       matches[0] == 'FAST TRACK' ||
+       matches[0] == 'FASTRACK'   ||
+       matches[0] == 'WITHDRAWN'     )
+    matches = div.search('div.description-trunc').inner_text.split('Description: ')[1].split(' - ', 3)
+    matches.delete_at(0)
+  end
+
+  if ( matches.count >= 2 )
     record = {
-      'info_url' => info_url,
-      'comment_url' => comment_url,
-      'council_reference' => clean_whitespace(h[1]),
-      'date_received' => Date.strptime(clean_whitespace(h[2]), '%d/%m/%Y').to_s,
-      # TODO: Some DAs have multiple addresses, we're just getting the first :(
-      'address' => clean_whitespace(tds[3].at('strong').inner_text) + ", QLD",
-      'description' => CGI::unescapeHTML(clean_whitespace(tds[3].inner_html.split('<br>')[1].split('-')[1..-2].join('-'))),
-      'date_scraped' => Date.today.to_s
+      'council_reference' => div.search('div')[0].inner_text.split('Application Number: ')[1].strip,
+      'address' => matches[0].strip,
+      'description' => matches[1].strip,
+      'info_url' => 'https://developmenti.sunshinecoast.qld.gov.au',
+      'comment_url' => 'mail@sunshinecoast.qld.gov.au',
+      'date_scraped' => Date.today,
+      'date_received' => Date.strptime( div.search('div.application-tile-property span.date-number').attr('data-date-number').value.to_s, '%Q' ) + 1
     }
 
-    if ScraperWiki.select("* from data where `council_reference`='#{record['council_reference']}'").empty? 
+    if (ScraperWiki.select("* from data where `council_reference`='#{record['council_reference']}'").empty? rescue true)
+      puts "Saving record " + record['council_reference'] + ", " + record['address']
+#       puts record
       ScraperWiki.save_sqlite(['council_reference'], record)
     else
       puts "Skipping already saved record " + record['council_reference']
     end
+  else
+    puts "error to parse council_reference's address: " + div.search('div')[0].inner_text.split('Application Number: ')[1].strip
   end
 end
-
-def scrape_and_follow_next_link(doc, comment_url)
-  scrape_table(doc, comment_url)
-  nextButton = doc.at('.rgPageNext')
-  unless nextButton.nil? || nextButton['onclick'] =~ /return false/
-    form = doc.forms.first
-    
-    # The joy of dealing with ASP.NET
-    form['__EVENTTARGET'] = nextButton['name']
-    form['__EVENTARGUMENT'] = ''
-    # It doesn't seem to work without these stupid values being set.
-    # Would be good to figure out where precisely in the javascript these values are coming from.
-    form['ctl00%24RadScriptManager1']=
-      'ctl00%24cphContent%24ctl00%24ctl00%24cphContent%24ctl00%24Radajaxpanel2Panel%7Cctl00%24cphContent%24ctl00%24ctl00%24RadGrid1%24ctl00%24ctl03%24ctl01%24ctl10'
-    form['ctl00_RadScriptManager1_HiddenField']=
-      '%3B%3BSystem.Web.Extensions%2C%20Version%3D3.5.0.0%2C%20Culture%3Dneutral%2C%20PublicKeyToken%3D31bf3856ad364e35%3Aen-US%3A0d787d5c-3903-4814-ad72-296cea810318%3Aea597d4b%3Ab25378d2%3BTelerik.Web.UI%2C%20Version%3D2009.1.527.35%2C%20Culture%3Dneutral%2C%20PublicKeyToken%3D121fae78165ba3d4%3Aen-US%3A1e3fef00-f492-4ed8-96ce-6371bc241e1c%3A16e4e7cd%3Af7645509%3A24ee1bba%3Ae330518b%3A1e771326%3Ac8618e41%3A4cacbc31%3A8e6f0d33%3Aed16cbdc%3A58366029%3Aaa288e2d'
-    doc = form.submit(form.button_with(:name => nextButton['name']))
-    scrape_and_follow_next_link(doc, comment_url)
-  end
-end
-
-@agent = Mechanize.new
-
-# Jump through bollocks agree screen
-doc = @agent.get(starting_url)
-doc = doc.forms.first.submit(doc.forms.first.button_with(:value => "I Agree"))
-doc = @agent.get(starting_url)
-
-scrape_and_follow_next_link(doc, comment_url)
