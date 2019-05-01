@@ -59,13 +59,9 @@ page.search('div.application-tile').each do |div|
       'date_received' => Date.strptime( div.search('div.application-tile-property span.date-number').attr('data-date-number').value.to_s, '%Q' ) + 1
     }
 
-    if (ScraperWiki.select("* from data where `council_reference`='#{record['council_reference']}'").empty? rescue true)
-      puts "Saving record " + record['council_reference'] + ", " + record['address']
+    puts "Saving record " + record['council_reference'] + ", " + record['address']
 #       puts record
-      ScraperWiki.save_sqlite(['council_reference'], record)
-    else
-      puts "Skipping already saved record " + record['council_reference']
-    end
+    ScraperWiki.save_sqlite(['council_reference'], record)
   else
     puts "error to parse council_reference's address: " + div.search('div')[0].inner_text.split('Application Number: ')[1].strip
   end
